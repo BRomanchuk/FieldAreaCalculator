@@ -38,7 +38,7 @@ def get_subfields_xy(field_bounds: list, geozone_num, geozone_let):
     :return: list of (x, y) bounds of the subfields
     """
     subfields = [np.array(subfield).T for subfield in field_bounds]
-    bounds_xy = [from_latlon(field[0], field[1], geozone_num, geozone_let) for field in subfields]
+    bounds_xy = [from_latlon(field[1], field[0], geozone_num, geozone_let) for field in subfields]
     return bounds_xy
 
 
@@ -111,28 +111,46 @@ def get_area_and_distance(
     gps_geozone_num : int = None,
     gps_geozone_let : str = None,
     
-    last_point_xy : list = None,
-    
-    last_path_distance : float = 0,
     track_polygon_simplification_m = 0.3
 ):
     """
-    calculates cumulative path distances and processed field area
-    :param tool_width: float : tool-width
-    :param gps_m_deviation: float : GPS deviation in meters
-    :param time: list timestamps
-    :param track_lat: list of track latitudes
-    :param track_lon: list of track longitudes
-    :param field_bounds: list of lists with raw GPS field bounds
-    :param encoded_field_polygon:  encoded version of the polygon in XY-system
-    :param encoded_calculated_track: encoded version of the polygon in XY-system
-    :param gps_geozone_num: GPS geozone number (UTM)
-    :param gps_geozone_let: GPS geozone letter (UTM)
-    :param last_point_xy: XY-coordinates of the last point of calculated track
-    :param last_path_distance: last calculated path distance
-    :param simplification_m: tolerance for the simplification of the calculated track
-    :return: list of cumulative path distances and areas, 
-            and updated parameters of the track and field
+    Calculates path distances and processed field area
+
+    Parameters
+    ----------
+    tool_width : float
+        Tool-width in meters.
+    gps_m_deviation : float 
+        GPS deviation in meters.
+    time : array-like
+        List of timestamps.
+    track_lat : array-like
+        List of track latitudes.
+    track_lon : array-like
+        List of track longitudes.
+    field_bounds : list of lists
+        List of lists with raw GPS field bounds !(lon, lat)!
+    encoded_field_polygon : str
+        Encoded version of the polygon in XY-system.
+    encoded_calculated_track : str
+        Encoded version of the calculated track in XY-system.
+    gps_geozone_num : int
+        GPS geozone number (UTM).
+    gps_geozone_let : str
+        GPS geozone letter (UTM).
+    simplification_m : float
+        Tolerance for the simplification of the calculated track.
+    
+    Returns
+    -------
+    distance_and_area_calculator : dict
+        Dict with list of path distances and areas, 
+        and updated parameters of the track and field:
+            encoded_field_polygon,
+            encoded_calculated_track,
+            gps_geozone_num,
+            gps_geozone_let.
+
     """
     
     # init field_polygon
@@ -170,17 +188,13 @@ def get_area_and_distance(
             field_polygon = wkt.loads(encoded_field_polygon)
     
     
-    # if the last processed point isn't defined
-    if last_point_xy is None: 
-        # then it is the first point of the current track
-        last_point_xy = [track_xy[0]]
-    # add last processed point to the track
-    track_xy = np.concatenate([last_point_xy, track_xy])
+    # dublicate the first point of the track
+    track_xy = np.concatenate([track_xy[:1], track_xy])
     
     # denoise track 
     track_xy = denoise_track(track_xy, gps_m_deviation)
     
-    
+
     # if the encoded calculated track representation isn't defined
     if encoded_calculated_track is None:
         # create empty calculated track 
@@ -190,18 +204,25 @@ def get_area_and_distance(
         calculated_track = wkt.loads(encoded_calculated_track)
         
         
-    # create cumulative path distance and area arrays
-    path_distance = np.concatenate([[last_path_distance], np.zeros(len(time)-1)])
-    field_processed = np.concatenate([[calculated_track.area], np.zeros(len(time)-1)])
+    # create path distance array and cumulative area array
+    path_distance = np.zeros(len(time))
+    cumulative_field_processed = np.concatenate([[calculated_track.area], np.zeros(len(time))])
     
-    
+
     # calculation loop : for two consecutive track points (i, i+1)
-    for i in range(len(time)-1):
+    # !! ADD index_from !!
+    for i in range(len(time)):
         # create LineString object as a subtrack
         subtrack = LineString(track_xy[i : i+2])
-        # compute distance between these points, and add new cumulative distance to the list
-        path_distance[i+1] = path_distance[i] + subtrack.length
+        # compute distance between these points, and add to the list
+        path_distance[i] = subtrack.intersection(field_polygon).length
 
+        # if the vehicle has no tool, continue calculating only path distance
+        if tool_width == 0:
+            continue
+        
+        # if the vehicle has the tool, calculate processed area
+        
         # add buffer to the subtrack, and intersect it with the field polygon
         subfield = subtrack.buffer(buffer) \
                            .intersection(field_polygon) 
@@ -211,11 +232,14 @@ def get_area_and_distance(
         # create simplified track to fasten the computations
         simplified = calculated_track.simplify(track_polygon_simplification_m, preserve_topology=False)
         # if the difference in areas is small, use simplified track as a new calculated track
-        if np.abs(simplified.area - calculated_track.area) < (tool_width * gps_m_deviation) and field_processed[i] < simplified.area:
+        if np.abs(simplified.area - calculated_track.area) < (tool_width * gps_m_deviation) and cumulative_field_processed[i] < simplified.area:
             calculated_track = simplified
             
         # add new cumulative area to the list
-        field_processed[i+1] = calculated_track.area   
+        cumulative_field_processed[i+1] = calculated_track.area   
+
+    # calculate processed area for each timestamp
+    field_processed = cumulative_field_processed[1:] - cumulative_field_processed[:-1]
 
     # create output dictionary
     distance_and_area_calculator = {
@@ -224,8 +248,6 @@ def get_area_and_distance(
 
         'gps_geozone_num' : gps_geozone_num,
         'gps_geozone_let' : gps_geozone_let,
-
-        'last_point_xy' : track_xy[-1].coords,
         
         'path_distance' : path_distance,
         'field_processed' : field_processed
